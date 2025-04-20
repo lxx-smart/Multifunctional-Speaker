@@ -1,0 +1,876 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include "Wire.h"
+#include "esp_spiram.h"
+#include <string.h>
+#include <ESP32Encoder.h>
+#include <vector>
+#include "radio.h"
+#include "TEA5767.h"
+#include "AudioTools.h"
+#include "SD.h"
+#include "Audio.h"
+#include <stdio.h>
+#include "esp_log.h"
+#include "esp_mac.h"
+#include "nvs_flash.h"
+#include "BluetoothA2DPSink.h"
+#include "esp_bt.h"
+#include "Ch376msc.h"
+
+
+// 外放接口定义
+const uint8_t I2S_BCLK = 26; /* Audio data bit clock */
+const uint8_t I2S_LRC = 27;  /* Audio data left and right clock */
+const uint8_t I2S_DIN = 25;  /* ESP32 audio data output (to speakers) */
+const uint8_t I2S_MCLK = 3;
+
+// 自定义 I2C 引脚
+#define MY_SDA 32
+#define MY_SCL 33
+
+I2SStream i2s;
+
+// 创建A2DP对象
+BluetoothA2DPSink a2dp_sink(i2s);
+
+Audio audio;
+
+TEA5767 radio; // Create an instance of Class for Si4703 Chip
+
+uint8_t test1;
+byte test2;
+
+char radioINO[12];
+
+#define FREQ_MIN 87.5     // FM最低频率(MHz)
+#define FREQ_MAX 108.0    // FM最高频率(MHz)
+#define RSSI_THRESHOLD 10 // 信号强度阈值
+#define SCAN_STEP 0.1     // 扫描步长(MHz)
+#define SCAN_DELAY 100    // 频率稳定时间(ms)
+
+static float freq = FREQ_MIN;
+
+TwoWire myWire = TwoWire(1);
+
+File rootDir;
+File currentFile;
+bool sdCardPresent = false;
+bool isPlaying = false;
+
+String filename = currentFile.name();
+
+// 创建OLED对象
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE, /* clock=*/22, /* data=*/21);
+
+// 硬件配置
+#define ENCODER_A 17  // A引脚
+#define ENCODER_B 4 // B引脚
+#define BTN_PIN 16   // 编码器按钮引脚
+
+// 创建ESP32Encoder对象
+ESP32Encoder myencoder;
+
+// 系统状态定义
+enum SystemState
+{
+  S_LOGO,      // 显示LOGO
+  S_MENU,      // 设置菜单
+  S_SUB_MENU,  // 一级菜单
+  S_SUB1_MENU, // 二级菜单
+  S_SUB2_MENU  // 三级菜单
+};
+
+// 设置菜单选项
+const char *menuOptions[] = {
+    "1. 音乐播放器",
+    "2. 蓝牙",
+    "3. 收音机",
+    "4. 均衡器",
+    "5. 关于"};
+
+// 选项总数
+const int numOptions = sizeof(menuOptions) / sizeof(menuOptions[0]);
+// 当前选中的选项索引
+int currentOptionIndex = 0;
+// 每页显示的选项数
+const int optionsPerPage = 2;
+
+// 子菜单独立变量
+int subMenuPos = 0; // S_SUB_MENU（关于菜单）的编码器位置
+bool hasExecuted = false;
+bool hasExecuted1 = false;
+bool hasExecuted2 = false;
+bool hasExecuted3 = false;
+bool hasExecuted4 = false;
+
+SystemState sysState = S_LOGO;    // 当前系统状态
+unsigned long stateEnterTime = 0; // 状态进入时间
+
+// 编码器变量
+int currentEncoderPos;  // 当前编码器位置
+int lastEncoderPos = 0; // 上一次编码器位置
+int delta;
+
+// 按钮状态
+bool btnPressed = false;        // 按钮是否按下
+unsigned long btnPressTime = 0; // 按钮按下时间
+
+int stateIndex = 1;
+
+int optionIndex = 0;
+int b = 10;
+int c = 0;
+int d = 0;
+int e = 40;
+int f = 0;
+int g = 40;
+
+esp_a2d_connection_state_t bluetooth_state = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
+bool is_bluetooth_screen_active = true; // 控制蓝牙界面显示
+
+char displayText[128] = {0};
+char displaywriter[128] = {0};
+
+bool BTstate = false;
+
+void openBluetooth();
+void closeBluetooth();
+void openRadio();
+void autoScan();
+bool autoScanSingle();
+
+// 开机画面
+static const unsigned char bmp1[] U8X8_PROGMEM = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x38, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x7C, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0xFE, 0x01, 0x00, 0x78, 0x00, 0x00, 0xFE, 0x3F, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x70, 0x00, 0x00, 0xFE, 0x3E, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0xF7, 0x00, 0xC0, 0xFF, 0x7F, 0x00, 0x30, 0x1F, 0x00, 0x1C, 0x0F, 0x00, 0x00,
+    0x00, 0x00, 0xC0, 0xE3, 0x01, 0xE0, 0xF9, 0x7F, 0x40, 0xFC, 0x3F, 0x00, 0x80, 0x07, 0x00, 0x00,
+    0x00, 0x00, 0xE0, 0xC1, 0x07, 0x70, 0xDF, 0x01, 0xC0, 0xFF, 0x3C, 0x00, 0xE0, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0xF0, 0xFE, 0x1F, 0x00, 0x5F, 0x01, 0xC0, 0x33, 0x1C, 0x00, 0xC0, 0xF1, 0x03, 0x00,
+    0x00, 0x00, 0xF8, 0x7F, 0xFF, 0x00, 0xF9, 0x07, 0x80, 0xF1, 0x1D, 0x00, 0xF8, 0xFF, 0x07, 0x00,
+    0x00, 0x00, 0x3C, 0x0F, 0xFE, 0xE0, 0xFF, 0x07, 0x80, 0xFF, 0x0F, 0xF0, 0xFF, 0xFF, 0x07, 0x00,
+    0x00, 0x00, 0x1F, 0xFE, 0x00, 0xC0, 0xC7, 0x03, 0x80, 0x3F, 0x0E, 0xF0, 0x8F, 0x03, 0x00, 0x00,
+    0x00, 0x80, 0xC7, 0xFF, 0x00, 0xC0, 0xEF, 0x0F, 0x80, 0xF3, 0x0F, 0x00, 0x80, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0xC0, 0xDF, 0x00, 0xF0, 0xFF, 0x7F, 0x00, 0xFF, 0x07, 0x00, 0x80, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0x60, 0xEE, 0x01, 0xF8, 0xFF, 0xFB, 0x01, 0x3F, 0xC7, 0x00, 0x80, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0xE0, 0xFF, 0x01, 0xBE, 0xE7, 0xFF, 0x00, 0x33, 0xC0, 0x00, 0x80, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0xC0, 0x2E, 0x00, 0xAE, 0x77, 0x0F, 0x00, 0x30, 0xC0, 0x01, 0x80, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0xFF, 0x07, 0xF0, 0x35, 0x0B, 0x00, 0x70, 0xE0, 0x01, 0xC0, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0xFC, 0xFF, 0x0F, 0xF0, 0xFF, 0x1F, 0x00, 0xF0, 0xFF, 0x01, 0xF8, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0xFC, 0xFF, 0x0F, 0xFC, 0xFF, 0x3F, 0x00, 0xE0, 0xFF, 0x00, 0xF8, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x78, 0x30, 0x00, 0x00, 0x0E, 0x00, 0xE0, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x33, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x39, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x3D, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0x31, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0x30, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x30, 0x8B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x30, 0x73, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+static const unsigned char back[] U8X8_PROGMEM = {
+    0x43,
+    0x63,
+    0x73,
+    0x7B,
+    0x7F,
+    0x7F,
+    0x7B,
+    0x73,
+    0x63,
+    0x43};
+
+static const unsigned char next[] U8X8_PROGMEM = {
+    0x61,
+    0x63,
+    0x67,
+    0x6F,
+    0x7F,
+    0x7F,
+    0x6F,
+    0x67,
+    0x63,
+    0x61};
+
+static const unsigned char begin[] U8X8_PROGMEM = {
+
+    0x00,
+    0x00,
+    0xC6,
+    0x00,
+    0xC6,
+    0x00,
+    0xC6,
+    0x00,
+    0xC6,
+    0x00,
+    0xC6,
+    0x00,
+    0xC6,
+    0x00,
+    0xC6,
+    0x00,
+    0xC6,
+    0x00,
+    0x00,
+    0x00};
+
+static const unsigned char pauses[] U8X8_PROGMEM = {
+    0x00,
+    0x00,
+    0x08,
+    0x00,
+    0x18,
+    0x00,
+    0x38,
+    0x00,
+    0x78,
+    0x00,
+    0x78,
+    0x00,
+    0x38,
+    0x00,
+    0x18,
+    0x00,
+    0x08,
+    0x00,
+    0x00,
+    0x00};
+
+void setI2S()
+{
+
+  // 在setup函数中配置I2S参数
+  i2s_config_t i2s_config = {
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+      .sample_rate = 44100,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_24BIT,
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+      .dma_buf_count = 4,        // 减少DMA缓冲区数量（默认8）
+      .dma_buf_len = 512,        // 缩短单个缓冲区长度（默认1024）
+      .use_apll = true,          // 启用 APLL
+  };
+
+  auto cfg = i2s.defaultConfig();
+  cfg.pin_mck = I2S_MCLK;
+  cfg.pin_bck = I2S_BCLK;
+  cfg.pin_ws = I2S_LRC;
+  cfg.pin_data = I2S_DIN;
+  i2s.begin(cfg);
+
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+}
+
+// 蓝牙连接状态回调函数
+void a2dp_state_callback(esp_a2d_connection_state_t state, void *)
+{
+  bluetooth_state = state; // 更新全局状态
+}
+
+// 蓝牙连接状态回调函数
+void handle_metadata(uint8_t attr_id, const uint8_t *value)
+{
+  if (bluetooth_state == ESP_A2D_CONNECTION_STATE_CONNECTED)
+  {
+    switch (attr_id)
+    {
+    case ESP_AVRC_MD_ATTR_TITLE:
+      strncpy(displayText, (const char *)value, sizeof(displayText) - 1);
+      break;
+    case ESP_AVRC_MD_ATTR_ARTIST:
+      strncpy(displaywriter, (const char *)value, sizeof(displaywriter) - 1);
+      break;
+    }
+  }
+}
+
+void playstatus_callback(esp_avrc_playback_stat_t playback)
+{
+  switch (playback)
+  {
+  case ESP_AVRC_PLAYBACK_PLAYING:
+    BTstate = true;
+    break;
+  case ESP_AVRC_PLAYBACK_PAUSED:
+    BTstate = false;
+    break;
+  }
+}
+
+// 开机Logo
+void drawLogo()
+{
+  u8g2.drawXBMP(0, 0, 128, 64, bmp1);
+  u8g2.sendBuffer();
+}
+
+// 设置画面
+void drawMenu()
+{
+  int startIndex = (currentOptionIndex / optionsPerPage) * optionsPerPage;
+
+  u8g2.clearBuffer();
+
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+  u8g2.drawUTF8(52, 17, "模式");
+
+  // 计算当前页面的起始选项索引
+
+  for (int i = 0; i < optionsPerPage; i++)
+  {
+    int index = startIndex + i;
+    if (index < numOptions)
+    {
+      if (index == currentOptionIndex)
+      {
+        u8g2.drawStr(0, 35 + i * 20, "> ");
+      }
+      else
+      {
+        u8g2.drawStr(0, 35 + i * 10, "  ");
+      }
+      u8g2.drawUTF8(20, 35 + i * 20, menuOptions[index]);
+    }
+  }
+
+  u8g2.sendBuffer();
+}
+
+void drawBluetooth()
+{
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+  u8g2.drawUTF8(52, 13, "蓝牙");
+
+  u8g2.drawXBMP(43, 52, 7, 10, back);
+  u8g2.drawXBMP(85, 52, 7, 10, next);
+
+  u8g2.drawRFrame(e, 50, 13, 14, 1);
+
+  // 动态显示连接状态
+  if (bluetooth_state == ESP_A2D_CONNECTION_STATE_CONNECTED)
+  {
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+
+    u8g2.setCursor(0, 30);
+    u8g2.print(displayText);
+
+    u8g2.setCursor(0, 45);
+    u8g2.print(displaywriter);
+
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2.drawUTF8(90, 11, "已连接");
+  }
+  else
+  {
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2.drawUTF8(90, 11, "未连接");
+    BTstate == false;
+  }
+
+  if (BTstate == true)
+  {
+    u8g2.drawXBMP(63, 52, 9, 10, begin);
+  }
+  else
+  {
+    u8g2.drawXBMP(63, 52, 9, 10, pauses);
+  }
+
+  u8g2.sendBuffer();
+}
+
+// TF卡
+void drawTF()
+{
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+  u8g2.drawUTF8(42, 17, "音乐播放器");
+
+  u8g2.drawUTF8(35, 40, "正在播放");
+  u8g2.setCursor(0, 60);
+  u8g2.print(filename);
+
+  u8g2.sendBuffer();
+}
+
+void drawRadio()
+{
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+  u8g2.drawUTF8(46, 13, "收音机");
+
+  u8g2.drawXBMP(43, 52, 7, 10, back);
+  u8g2.drawXBMP(85, 52, 7, 10, next);
+
+  u8g2.setCursor(35, 37);
+  u8g2.print(radioINO);
+
+  u8g2.drawRFrame(g, 50, 13, 14, 1);
+
+  u8g2.sendBuffer();
+}
+
+// 打开蓝牙
+void openBluetooth()
+{
+  if (!hasExecuted)
+  {
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9); // 增强抗干扰能力
+
+    a2dp_sink.start("Big Banana");
+    a2dp_sink.set_channels(I2S_CHANNEL_STEREO);
+
+    // 获取当前连接设备的地址
+    esp_bd_addr_t peer;
+    memcpy(peer, a2dp_sink.get_current_peer_address(), sizeof(esp_bd_addr_t));
+    // 断开 A2DP 连接
+    esp_a2d_sink_disconnect(peer);
+    a2dp_sink.set_auto_reconnect(true, 5);
+
+    hasExecuted = true;
+  }
+}
+
+// 关闭蓝牙
+void closeBluetooth()
+{
+  if (!hasExecuted1)
+  {
+    // 停止音乐播放，利用类中已有的方法
+    a2dp_sink.stop();
+
+    // 获取当前连接设备的地址
+    esp_bd_addr_t peer;
+    memcpy(peer, a2dp_sink.get_current_peer_address(), sizeof(esp_bd_addr_t));
+    // 断开 A2DP 连接
+    esp_a2d_sink_disconnect(peer);
+
+    hasExecuted1 = true;
+  }
+}
+
+void BTbutton()
+{
+  switch (d)
+  {
+  case 0:
+    a2dp_sink.previous();
+    break;
+  case 1:
+    if (BTstate == false)
+    {
+      a2dp_sink.play();
+    }
+    else
+    {
+      a2dp_sink.pause();
+    }
+    break;
+  case 2:
+    a2dp_sink.next();
+    break;
+  default:
+    break;
+  }
+}
+
+void RDbutton()
+{
+  switch (f)
+  {
+  case 0:
+    radio.seekUp(true);
+    break;
+  case 1:
+    break;
+  case 2:
+    radio.seekDown(true);
+    break;
+    break;
+  default:
+    break;
+  }
+}
+
+void playNextSong()
+{
+  while (true)
+  {
+    if (!sdCardPresent)
+      return;
+    while ((currentFile = rootDir.openNextFile()))
+    {
+      if (currentFile.isDirectory())
+        continue;
+      filename = currentFile.name();
+      if (filename.endsWith(".flac"))
+      {
+        Serial.print("正在播放: ");
+        Serial.println(filename);
+        currentFile.close();
+        audio.connecttoFS(SD, filename.c_str());
+        return;
+      }
+      currentFile.close();
+    }
+    rootDir.rewindDirectory();
+  }
+}
+
+void Audio_begin()
+{
+  if (!hasExecuted2)
+  {
+    SD.begin();
+    hasExecuted2 = true;
+  }
+
+  // SD卡状态检测
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 1000)
+  { // 每秒检测一次
+    lastCheck = millis();
+    bool currentStatus = SD.exists("/"); // 通过检测根目录存在性判断
+
+    if (currentStatus != sdCardPresent)
+    {
+      sdCardPresent = currentStatus;
+      if (!sdCardPresent)
+      {
+        audio.stopSong();
+        Serial.println("SD卡被拔出");
+        rootDir.close();
+      }
+      else
+      {
+        Serial.println("SD卡重新插入");
+        rootDir = SD.open("/");
+        playNextSong();
+      }
+    }
+  }
+
+  audio.loop();
+
+  // 自动播放下一曲
+  if (sdCardPresent && !audio.isRunning())
+  {
+    playNextSong();
+  }
+}
+
+void openRadio()
+{
+  if (!hasExecuted3)
+  {
+    radio.initWire(myWire);
+
+    // Enable information to the Serial port
+    radio.debugEnable();
+
+    // HERE: adjust the frequency to a local sender
+    radio.setMute(false);
+    radio.setBassBoost(true);
+    radio.setMono(false);
+    radio.setBand(RADIO_BAND_FM);
+
+    hasExecuted3 = true;
+  }
+  radio.setFrequency(9750);
+  radio.formatFrequency(radioINO, sizeof(radioINO));
+
+  Serial.print("Station:"); 
+  Serial.println(radioINO);
+  
+  Serial.print("Radio:"); 
+  radio.debugRadioInfo();
+  
+  Serial.print("Audio:"); 
+  radio.debugAudioInfo();
+}
+
+void closeRadio()
+{
+  if (!hasExecuted4)
+  {
+    hasExecuted4 = true;
+  }
+}
+
+void handleBTEnc(int delta)
+{
+  if (delta != 0)
+  {
+    d = constrain(d + (delta > 0 ? 1 : -1), 0, 2); // 限制 c 在 0-3
+    e = 40 + (21 * d);
+  }
+}
+
+void handleRDEnc(int delta)
+{
+  if (delta != 0)
+  {
+    f = constrain(f + (delta > 0 ? 1 : -1), 0, 2); // 限制 c 在 0-3
+    g = 40 + (21 * f);
+  }
+}
+
+// 处理菜单编码器
+void handleMenuEnc(int delta)
+{
+  if (delta == 1)
+  {
+    optionIndex++;
+    // 编码器旋转方向判断
+    currentOptionIndex = (currentOptionIndex + 1) % numOptions;
+  }
+  else
+  {
+    optionIndex--;
+    currentOptionIndex = (currentOptionIndex - 1 + numOptions) % numOptions;
+  }
+}
+
+// 处理编码器
+void handleEncoder()
+{
+  currentEncoderPos = myencoder.getCount();
+
+  if (currentEncoderPos != lastEncoderPos)
+  {
+    int localDelta = currentEncoderPos - lastEncoderPos;
+    lastEncoderPos = currentEncoderPos;
+
+    switch (sysState)
+    {
+    case S_MENU:
+      handleMenuEnc(localDelta);
+      break;
+    case S_SUB_MENU:
+
+      break;
+    case S_SUB1_MENU:
+      handleBTEnc(localDelta);
+    case S_SUB2_MENU:
+      handleRDEnc(localDelta);
+      break;
+    }
+  }
+}
+
+// 按键处理
+void handleButton()
+{
+  bool currentBtn = digitalRead(BTN_PIN) == LOW;
+  static bool lastBtnState = false;
+  static uint32_t pressStartTime = 0;
+
+  // 状态变化检测
+  if (currentBtn != lastBtnState)
+  {
+    if (currentBtn)
+    {
+      pressStartTime = millis();
+    }
+    else
+    {
+      uint32_t pressDuration = millis() - pressStartTime;
+
+      // 短按处理（>50ms防抖）
+      if (pressDuration > 50 && pressDuration < 1000)
+      {
+        if (sysState == S_MENU)
+        {
+          optionIndex = currentOptionIndex;
+          switch (optionIndex)
+          {
+          case 0:
+            sysState = S_SUB_MENU;
+            subMenuPos = 0; // 重置关于菜单的编码器位置
+            stateEnterTime = millis();
+            break;
+          case 1:
+            sysState = S_SUB1_MENU;
+            stateEnterTime = millis();
+            // 新增代码：重置编码器位置
+            myencoder.clearCount(); // 清除编码器累计值
+            lastEncoderPos = 0;     // 重置上次位置为0
+            break;
+          case 2:
+            sysState = S_SUB2_MENU;
+            stateEnterTime = millis();
+            break;
+          default:
+            break;
+          }
+        }
+        else if (sysState == S_SUB_MENU)
+        {
+          stateEnterTime = millis();
+        }
+        else if (sysState == S_SUB1_MENU)
+        {
+          BTbutton();
+          stateEnterTime = millis();
+        }
+        else if (sysState == S_SUB2_MENU)
+        {
+          RDbutton();
+          stateEnterTime = millis();
+        }
+      }
+
+      // 长按（>2秒）
+      if (pressDuration > 2000)
+      {
+        if (sysState == S_SUB_MENU || sysState == S_SUB1_MENU || sysState == S_SUB2_MENU)
+        {
+          sysState = S_MENU; // 切换至菜单界面
+          stateEnterTime = millis();
+        }
+      }
+    }
+    lastBtnState = currentBtn;
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  myWire.begin(MY_SDA, MY_SCL);
+
+  u8g2.begin();
+  u8g2.enableUTF8Print();
+
+  // 初始化功能引脚
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  // 初始化编码器引脚
+  myencoder.attachSingleEdge(ENCODER_A, ENCODER_B);
+  myencoder.clearCount();
+
+  // 初始化状态
+  sysState = S_LOGO;
+  stateEnterTime = millis();
+
+  // 初始化 nVS 分区
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+  {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(ret);
+
+  setI2S();
+  a2dp_sink.set_on_connection_state_changed(a2dp_state_callback); // 注册回调
+  a2dp_sink.set_avrc_metadata_callback(handle_metadata);          // 注册元数据回调
+  a2dp_sink.set_avrc_rn_playstatus_callback(playstatus_callback);
+}
+
+void loop()
+{
+
+  // 处理编码器旋转
+  handleEncoder();
+
+  // 处理按钮事件
+  handleButton();
+
+  // 状态机逻辑
+  switch (sysState)
+  {
+  case S_LOGO:
+    // 显示LOGO 2秒后进入主界面
+    drawLogo();
+    if (millis() - stateEnterTime > 2000)
+    {
+      sysState = S_SUB1_MENU;
+      stateEnterTime = millis();
+    }
+    break;
+
+  case S_MENU:
+    drawMenu();
+    break;
+
+  case S_SUB_MENU:
+    stateIndex = 0;
+    drawTF();
+    break;
+
+  case S_SUB1_MENU:
+    stateIndex = 1;
+    drawBluetooth();
+    break;
+
+  case S_SUB2_MENU:
+    stateIndex = 2;
+    drawRadio();
+    break;
+  }
+
+  switch (stateIndex)
+  {
+  case 0:
+    closeRadio();
+    closeBluetooth();
+    Audio_begin();
+    break;
+
+  case 1:
+    closeRadio();
+    openBluetooth();
+    break;
+
+  case 2:
+    closeBluetooth();
+    openRadio();
+    break;
+  default:
+    break;
+  }
+}

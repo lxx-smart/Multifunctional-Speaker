@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "UNO R3",
+			"path": "../../UNO R3"
+		},
+		{
+			"name": "ESP32wrover",
+			"path": "../../开发板/ESP32wrover"
+		}
+	],
+	"settings": {}
+}
